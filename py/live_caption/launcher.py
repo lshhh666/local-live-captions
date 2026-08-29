@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import queue
 import subprocess
 import sys
@@ -75,12 +76,21 @@ def blend_hex_colors(foreground: str, background: str, opacity: float) -> str:
     return "#" + "".join(f"{channel:02x}" for channel in blended)
 
 
+def audio_meter_level(rms: float) -> float:
+    """Map RMS audio energy to a stable 0..1 logarithmic meter level."""
+    if rms <= 0:
+        return 0.0
+    decibels = 20.0 * math.log10(max(rms, 1e-9))
+    return min(1.0, max(0.0, (decibels + 60.0) / 60.0))
+
+
 @dataclass(frozen=True, slots=True)
 class LauncherOptions:
     language: str = "en"
     font_size: int = 16
     opacity: float = 0.90
     cpu: bool = False
+    device_index: int | None = None
 
 
 def validate_options(options: LauncherOptions) -> None:
@@ -90,6 +100,8 @@ def validate_options(options: LauncherOptions) -> None:
         raise ValueError("字幕字号必须在 12 到 32 之间")
     if not 0.50 <= options.opacity <= 1.00:
         raise ValueError("透明度必须在 50% 到 100% 之间")
+    if options.device_index is not None and options.device_index < 0:
+        raise ValueError("音频设备编号无效")
 
 
 def application_root() -> Path:
@@ -132,6 +144,8 @@ def build_caption_command(
     ])
     if options.cpu:
         command.extend(("--cpu", "--compute", "int8"))
+    if options.device_index is not None:
+        command.extend(("--device-index", str(options.device_index)))
     return command
 
 
@@ -155,6 +169,49 @@ def invalid_large_files(project_root: Path) -> tuple[Path, ...]:
     return tuple(invalid)
 
 
+def check_installation_files(
+    project_root: Path, portable: bool = False
+) -> tuple[bool, str]:
+    try:
+        missing = tuple(
+            path
+            for path in required_paths(project_root, portable)
+            if not path.is_file()
+        )
+        if missing:
+            return False, f"缺少 {len(missing)} 个运行文件"
+        invalid = invalid_large_files(project_root)
+        if invalid:
+            return False, f"有 {len(invalid)} 个模型文件不完整"
+        return True, "模型与运行文件完整"
+    except OSError as error:
+        return False, f"无法检查运行文件：{error}"
+
+
+def probe_cuda_environment() -> tuple[bool, bool, str]:
+    """Check the CTranslate2 CPU runtime and optional CUDA acceleration."""
+    try:
+        import ctranslate2
+
+        cpu_compute_types = ctranslate2.get_supported_compute_types("cpu")
+        if "int8" not in cpu_compute_types:
+            return False, False, "CTranslate2 CPU 运行时不支持 int8"
+    except Exception as error:
+        return False, False, f"CTranslate2 运行库加载失败：{error}"
+
+    try:
+        device_count = ctranslate2.get_cuda_device_count()
+        if device_count < 1:
+            return True, False, "未检测到可用的 NVIDIA CUDA 设备"
+        compute_types = ctranslate2.get_supported_compute_types("cuda")
+        if "float16" not in compute_types:
+            return True, False, "显卡不支持当前字幕模型需要的 float16"
+        suffix = "" if device_count == 1 else f"（{device_count} 张）"
+        return True, True, f"NVIDIA CUDA 可用{suffix}"
+    except Exception as error:
+        return True, False, f"CUDA 不可用，CPU 运行时正常：{error}"
+
+
 class CaptionLauncher:
     def __init__(self) -> None:
         import tkinter as tk
@@ -168,12 +225,31 @@ class CaptionLauncher:
         self._close_requested = False
         self._force_stop_job = None
         self._stop_requested = False
+        self._audio_devices: dict[int, dict] = {}
+        self._selected_device_index: int | None = None
+        self._device_scan_complete = False
+        self._device_scan_running = False
+        self._device_scan_generation = 0
+        self._start_validation_running = False
+        self._start_attempt = 0
+        self._audio_test_running = False
+        self._audio_test_cancel = threading.Event()
+        self._last_audio_level = 0.0
+        self._cuda_available: bool | None = None
+        self._runtime_available: bool | None = None
+        self._installation_ready: bool | None = None
+        self._installation_message = "正在检查运行文件"
+        self._environment_check_complete = False
+        self._environment_check_running = False
+        self._close_deadline_job = None
 
         root = tk.Tk()
         self._root = root
         root.title("本地实时字幕")
-        root.geometry("780x630")
-        root.minsize(740, 620)
+        default_width = min(840, max(480, root.winfo_screenwidth() - 40))
+        default_height = min(740, max(480, root.winfo_screenheight() - 80))
+        root.geometry(f"{default_width}x{default_height}")
+        root.minsize(min(700, default_width), min(650, default_height))
         root.configure(bg="#090e1a")
         root.protocol("WM_DELETE_WINDOW", self._request_close)
         self._colors = {
@@ -285,8 +361,58 @@ class CaptionLauncher:
             font=("Microsoft YaHei UI", 9),
         ).pack(anchor="w", padx=(20, 0), pady=(3, 0))
 
-        main = tk.Frame(outer, bg=self._colors["background"], padx=28, pady=24)
-        main.grid(row=0, column=1, sticky="nsew")
+        main_host = tk.Frame(outer, bg=self._colors["background"])
+        main_host.grid(row=0, column=1, sticky="nsew")
+        main_host.grid_rowconfigure(0, weight=1)
+        main_host.grid_columnconfigure(0, weight=1)
+        self._main_canvas = tk.Canvas(
+            main_host,
+            bg=self._colors["background"],
+            highlightthickness=0,
+            bd=0,
+        )
+        self._main_canvas.grid(row=0, column=0, sticky="nsew")
+        self._main_scrollbar = tk.Scrollbar(
+            main_host,
+            orient="vertical",
+            command=self._main_canvas.yview,
+            width=10,
+            troughcolor=self._colors["background"],
+            bg="#263550",
+            activebackground="#344664",
+            relief="flat",
+            bd=0,
+        )
+        self._main_scrollbar.grid(row=0, column=1, sticky="ns")
+        self._main_hscrollbar = tk.Scrollbar(
+            main_host,
+            orient="horizontal",
+            command=self._main_canvas.xview,
+            width=10,
+            troughcolor=self._colors["background"],
+            bg="#263550",
+            activebackground="#344664",
+            relief="flat",
+            bd=0,
+        )
+        self._main_hscrollbar.grid(row=1, column=0, sticky="ew")
+        self._main_canvas.configure(
+            yscrollcommand=self._main_scrollbar.set,
+            xscrollcommand=self._main_hscrollbar.set,
+        )
+        main = tk.Frame(
+            self._main_canvas,
+            bg=self._colors["background"],
+            padx=28,
+            pady=18,
+        )
+        self._main_content = main
+        self._main_canvas_window = self._main_canvas.create_window(
+            (0, 0), window=main, anchor="nw"
+        )
+        main.bind("<Configure>", self._sync_main_scroll_region)
+        self._main_canvas.bind("<Configure>", self._resize_main_content)
+        root.bind("<MouseWheel>", self._scroll_main_content)
 
         header = tk.Frame(main, bg=self._colors["background"])
         header.pack(fill="x")
@@ -316,10 +442,121 @@ class CaptionLauncher:
             font=("Microsoft YaHei UI", 9),
         ).pack(anchor="w", pady=(2, 14))
 
+        audio_card = tk.Frame(main, bg=self._colors["surface"], padx=18, pady=13)
+        audio_card.pack(fill="x")
+        audio_header = tk.Frame(audio_card, bg=self._colors["surface"])
+        audio_header.pack(fill="x")
+        tk.Label(
+            audio_header,
+            text="系统声音",
+            bg=self._colors["surface"],
+            fg=self._colors["text"],
+            font=("Microsoft YaHei UI", 11, "bold"),
+        ).pack(side="left")
+        self._environment_status = tk.Label(
+            audio_header,
+            text="正在进行启动前自检……",
+            bg=self._colors["surface"],
+            fg="#fbbf24",
+            font=("Microsoft YaHei UI", 8, "bold"),
+        )
+        self._environment_status.pack(side="right")
+
+        device_row = tk.Frame(audio_card, bg=self._colors["surface"])
+        device_row.pack(fill="x", pady=(9, 7))
+        device_row.grid_columnconfigure(0, weight=1)
+        self._device_menu_button = tk.Menubutton(
+            device_row,
+            text="正在查找音频设备……",
+            width=34,
+            anchor="w",
+            bg=self._colors["surface_alt"],
+            activebackground="#243451",
+            fg="#dce3ee",
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=12,
+            pady=7,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self._device_menu_button.grid(row=0, column=0, sticky="ew")
+        self._device_menu = tk.Menu(
+            self._device_menu_button,
+            tearoff=False,
+            bg=self._colors["surface_alt"],
+            fg="#e5eaf3",
+            activebackground=self._colors["accent"],
+            activeforeground="#ffffff",
+            bd=0,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self._device_menu_button.configure(menu=self._device_menu)
+        self._refresh_devices_button = tk.Button(
+            device_row,
+            text="↻  刷新",
+            command=self._refresh_devices,
+            bg="#25324a",
+            activebackground="#30415f",
+            fg=self._colors["muted"],
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=10,
+            pady=7,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self._refresh_devices_button.grid(row=0, column=1, padx=(8, 0))
+        self._audio_test_button = tk.Button(
+            device_row,
+            text="检测声音",
+            command=self._start_audio_test,
+            bg="#3b356f",
+            activebackground="#4a4385",
+            fg="#d8d5ff",
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=10,
+            pady=7,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            state="disabled",
+        )
+        self._audio_test_button.grid(row=0, column=2, padx=(8, 0))
+
+        meter_row = tk.Frame(audio_card, bg=self._colors["surface"])
+        meter_row.pack(fill="x")
+        meter_row.grid_columnconfigure(0, weight=1)
+        self._audio_meter = tk.Canvas(
+            meter_row,
+            height=8,
+            bg="#263550",
+            highlightthickness=0,
+            bd=0,
+        )
+        self._audio_meter.grid(row=0, column=0, sticky="ew", pady=4)
+        self._audio_level_bar = self._audio_meter.create_rectangle(
+            0, 0, 0, 8, fill="#4ade80", outline=""
+        )
+        self._audio_meter.bind(
+            "<Configure>", lambda event: self._set_audio_level(self._last_audio_level)
+        )
+        self._audio_test_status = tk.Label(
+            meter_row,
+            text="选择设备后可检测声音",
+            bg=self._colors["surface"],
+            fg=self._colors["dim"],
+            font=("Microsoft YaHei UI", 8),
+        )
+        self._audio_test_status.grid(row=0, column=1, sticky="e", padx=(12, 0))
+
         self._preview = tk.Frame(
             main, bg=self._colors["surface"], padx=18, pady=14
         )
-        self._preview.pack(fill="x")
+        self._preview.pack(fill="x", pady=(10, 0))
         preview_header = tk.Frame(self._preview, bg=self._colors["surface"])
         preview_header.pack(fill="x")
         preview_title = tk.Label(
@@ -592,20 +829,354 @@ class CaptionLauncher:
         self._opacity.trace_add("write", self._update_values)
         self._update_values()
         self._append_log("准备就绪。选择语言后点击“开始字幕”。")
+        self._refresh_devices()
+        self._start_environment_check()
+        self._refresh_start_availability()
         root.after(100, self._poll_events)
 
     def run(self) -> None:
         self._root.mainloop()
 
+    def _resize_main_content(self, event) -> None:
+        requested_width = self._main_content.winfo_reqwidth()
+        self._main_canvas.itemconfigure(
+            self._main_canvas_window,
+            width=max(event.width, requested_width),
+        )
+        self._root.after_idle(self._sync_main_scroll_region)
+
+    def _sync_main_scroll_region(self, event=None) -> None:
+        del event
+        target_width = max(
+            self._main_canvas.winfo_width(),
+            self._main_content.winfo_reqwidth(),
+        )
+        self._main_canvas.itemconfigure(self._main_canvas_window, width=target_width)
+        bounds = self._main_canvas.bbox("all")
+        if bounds is None:
+            return
+        self._main_canvas.configure(scrollregion=bounds)
+        content_width = bounds[2] - bounds[0]
+        content_height = bounds[3] - bounds[1]
+        if content_width > self._main_canvas.winfo_width() + 2:
+            self._main_hscrollbar.grid()
+        else:
+            self._main_canvas.xview_moveto(0)
+            self._main_hscrollbar.grid_remove()
+        if content_height > self._main_canvas.winfo_height() + 2:
+            self._main_scrollbar.grid()
+        else:
+            self._main_canvas.yview_moveto(0)
+            self._main_scrollbar.grid_remove()
+
+    def _scroll_main_content(self, event) -> str | None:
+        if not self._main_scrollbar.winfo_ismapped() or not event.delta:
+            return None
+        self._main_canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
+
+    def _refresh_devices(self) -> None:
+        if (
+            self._controls_running
+            or self._audio_test_running
+            or self._start_validation_running
+            or self._close_requested
+        ):
+            return
+        self._device_menu_button.configure(
+            text="正在查找音频设备……", state="disabled"
+        )
+        self._device_scan_complete = False
+        self._device_scan_running = True
+        self._device_scan_generation += 1
+        generation = self._device_scan_generation
+        self._refresh_start_availability()
+        self._refresh_devices_button.configure(state="disabled")
+        self._audio_test_button.configure(state="disabled")
+        threading.Thread(
+            target=self._load_audio_devices,
+            args=(generation,),
+            name="launcher-audio-devices",
+            daemon=True,
+        ).start()
+
+    def _load_audio_devices(self, generation: int) -> None:
+        try:
+            from .audio_capture import SystemAudioCapture
+
+            devices = SystemAudioCapture.list_loopback_devices()
+            self._events.put(("devices", (generation, devices)))
+        except Exception as error:
+            self._events.put(("device_error", (generation, str(error))))
+
+    def _apply_audio_devices(self, devices: list[dict]) -> None:
+        self._device_scan_complete = True
+        self._device_scan_running = False
+        previous_index = self._selected_device_index
+        self._audio_devices = {
+            int(device["index"]): dict(device)
+            for device in devices
+            if "index" in device and device.get("isLoopbackDevice", True)
+        }
+        self._device_menu.delete(0, "end")
+        self._device_menu.add_command(
+            label="自动选择默认输出设备",
+            command=lambda: self._select_device(None),
+        )
+        if self._audio_devices:
+            self._device_menu.add_separator()
+        for index, device in self._audio_devices.items():
+            rate = int(device.get("defaultSampleRate", 0))
+            label = f"{device.get('name', f'设备 {index}')}  ·  {rate} Hz"
+            self._device_menu.add_command(
+                label=label,
+                command=lambda value=index: self._select_device(value),
+            )
+        if previous_index not in self._audio_devices:
+            previous_index = None
+        self._select_device(previous_index)
+        self._refresh_devices_button.configure(
+            state="disabled" if self._controls_running else "normal"
+        )
+        self._refresh_start_availability()
+
+    def _select_device(self, device_index: int | None) -> None:
+        if (
+            self._controls_running
+            or self._audio_test_running
+            or self._start_validation_running
+            or self._close_requested
+        ):
+            return
+        self._selected_device_index = device_index
+        if device_index is None:
+            text = "自动选择默认输出设备  ▾"
+        else:
+            device = self._audio_devices.get(device_index)
+            text = (
+                f"{device.get('name', f'设备 {device_index}')}  ▾"
+                if device is not None
+                else "自动选择默认输出设备  ▾"
+            )
+        self._device_menu_button.configure(text=text, state="normal")
+        test_state = "normal" if self._audio_devices else "disabled"
+        self._audio_test_button.configure(state=test_state)
+        self._audio_test_status.configure(
+            text="点击“检测声音”并播放视频", fg=self._colors["dim"]
+        )
+        self._set_audio_level(0.0)
+
+    def _start_audio_test(self) -> None:
+        if (
+            self._controls_running
+            or self._audio_test_running
+            or self._start_validation_running
+            or not self._audio_devices
+            or self._close_requested
+        ):
+            return
+        self._audio_test_running = True
+        self._audio_test_cancel.clear()
+        self._device_menu_button.configure(state="disabled")
+        self._refresh_devices_button.configure(state="disabled")
+        self._audio_test_button.configure(state="disabled", text="检测中……")
+        self._start_button.configure(state="disabled")
+        self._audio_test_status.configure(
+            text="正在监听 2 秒，请播放视频", fg="#fbbf24"
+        )
+        self._set_audio_level(0.0)
+        self._refresh_start_availability()
+        threading.Thread(
+            target=self._run_audio_test,
+            name="launcher-audio-test",
+            daemon=True,
+        ).start()
+
+    def _run_audio_test(self) -> None:
+        capture = None
+        peak_rms = 0.0
+        test_error = None
+        cancelled = self._audio_test_cancel.is_set()
+        try:
+            if not cancelled:
+                from .audio_capture import SystemAudioCapture
+
+                def measure(samples) -> None:
+                    nonlocal peak_rms
+                    rms = (
+                        float((samples * samples).mean() ** 0.5)
+                        if len(samples)
+                        else 0.0
+                    )
+                    peak_rms = max(peak_rms, rms)
+                    self._events.put(("audio_level", audio_meter_level(rms)))
+
+                capture = SystemAudioCapture(measure)
+                cancelled = self._audio_test_cancel.is_set()
+                if not cancelled:
+                    device = capture.start(self._selected_device_index)
+                    self._events.put(
+                        ("audio_test_device", device.get("name", "系统声音"))
+                    )
+                    cancelled = self._audio_test_cancel.wait(2.0)
+        except Exception as error:
+            test_error = str(error)
+            cancelled = self._audio_test_cancel.is_set()
+        finally:
+            if capture is not None:
+                try:
+                    capture.stop()
+                except Exception as error:
+                    test_error = test_error or str(error)
+        if test_error is not None:
+            self._events.put(("audio_test_error", test_error))
+        elif cancelled:
+            self._events.put(("audio_test_cancelled", None))
+        else:
+            self._events.put(("audio_test_complete", peak_rms))
+
+    def _finish_audio_test(
+        self,
+        peak_rms: float | None,
+        error: str | None = None,
+        cancelled: bool = False,
+    ) -> None:
+        self._audio_test_running = False
+        self._audio_test_button.configure(text="检测声音")
+        if cancelled:
+            self._audio_test_status.configure(text="声音检测已取消", fg=self._colors["dim"])
+            self._set_audio_level(0.0)
+        elif error is not None:
+            self._audio_test_status.configure(text="声音检测失败", fg="#f87171")
+            self._set_audio_level(0.0)
+            self._append_log(f"声音检测失败：{error}")
+        elif peak_rms is not None and peak_rms >= 0.00003:
+            self._audio_test_status.configure(text="检测到系统声音 ✓", fg="#4ade80")
+            self._set_audio_level(audio_meter_level(peak_rms))
+        else:
+            self._audio_test_status.configure(
+                text="未检测到声音，请播放视频后重试", fg="#fbbf24"
+            )
+            self._set_audio_level(0.0)
+        self._device_menu_button.configure(
+            state="disabled" if self._controls_running else "normal"
+        )
+        self._refresh_devices_button.configure(
+            state="disabled" if self._controls_running else "normal"
+        )
+        self._audio_test_button.configure(
+            state=(
+                "normal"
+                if self._audio_devices and not self._controls_running
+                else "disabled"
+            )
+        )
+        self._refresh_start_availability()
+
+    def _set_audio_level(self, level: float) -> None:
+        self._last_audio_level = min(1.0, max(0.0, level))
+        width = max(1, self._audio_meter.winfo_width())
+        height = max(1, self._audio_meter.winfo_height())
+        self._audio_meter.coords(
+            self._audio_level_bar,
+            0,
+            0,
+            int(width * self._last_audio_level),
+            height,
+        )
+
+    def _start_environment_check(self) -> None:
+        self._environment_check_complete = False
+        self._environment_check_running = True
+        threading.Thread(
+            target=self._run_environment_check,
+            name="launcher-environment-check",
+            daemon=True,
+        ).start()
+
+    def _run_environment_check(self) -> None:
+        try:
+            files_ready, files_message = check_installation_files(
+                self._project_root, self._portable
+            )
+            runtime_ready, cuda_ready, cuda_message = probe_cuda_environment()
+        except Exception as error:
+            files_ready = False
+            files_message = f"启动前自检失败：{error}"
+            runtime_ready = False
+            cuda_ready = False
+            cuda_message = "GPU 检测未完成"
+        self._events.put(
+            (
+                "environment",
+                (
+                    files_ready,
+                    files_message,
+                    runtime_ready,
+                    cuda_ready,
+                    cuda_message,
+                ),
+            )
+        )
+
+    def _apply_environment_check(
+        self,
+        files_ready: bool,
+        files_message: str,
+        runtime_ready: bool,
+        cuda_ready: bool,
+        cuda_message: str,
+    ) -> None:
+        self._installation_ready = files_ready
+        self._installation_message = files_message
+        self._runtime_available = runtime_ready
+        self._cuda_available = cuda_ready
+        self._environment_check_complete = True
+        self._environment_check_running = False
+        self._append_log(f"启动前自检：{files_message}；{cuda_message}。")
+        self._refresh_environment_status()
+        self._refresh_start_availability()
+
+    def _refresh_start_availability(self) -> None:
+        ready = (
+            not self._controls_running
+            and not self._audio_test_running
+            and not self._start_validation_running
+            and not self._close_requested
+            and self._device_scan_complete
+            and bool(self._audio_devices)
+            and self._environment_check_complete
+            and self._installation_ready is True
+            and self._runtime_available is True
+        )
+        self._start_button.configure(state="normal" if ready else "disabled")
+
+    def _refresh_environment_status(self) -> None:
+        if self._installation_ready is False:
+            text, color = "运行文件异常", "#f87171"
+        elif self._installation_ready is None:
+            text, color = "正在进行启动前自检……", "#fbbf24"
+        elif self._runtime_available is False:
+            text, color = "识别运行库异常", "#f87171"
+        elif self._cpu.get():
+            text, color = "文件 ✓  ·  CPU 模式", "#fbbf24"
+        elif self._cuda_available:
+            text, color = "文件 ✓  ·  GPU ✓", "#4ade80"
+        elif self._cuda_available is False:
+            text, color = "文件 ✓  ·  GPU 不可用", "#f87171"
+        else:
+            text, color = "文件 ✓  ·  正在检测 GPU", "#fbbf24"
+        self._environment_status.configure(text=text, fg=color)
+
     def _select_language(self, language: str) -> None:
-        if self._controls_running:
+        if self._controls_running or self._start_validation_running:
             return
         self._language.set(language)
         self._refresh_language_buttons()
         self._update_preview_language()
 
     def _language_changed(self) -> None:
-        if self._controls_running:
+        if self._controls_running or self._start_validation_running:
             return
         self._refresh_language_buttons()
         self._update_preview_language()
@@ -657,10 +1228,12 @@ class CaptionLauncher:
             )
 
     def _toggle_cpu_mode(self) -> None:
-        if self._controls_running:
+        if self._controls_running or self._start_validation_running:
             return
         self._cpu.set(not self._cpu.get())
         self._refresh_cpu_toggle()
+        self._refresh_environment_status()
+        self._refresh_start_availability()
 
     def _refresh_cpu_toggle(self) -> None:
         enabled = self._cpu.get()
@@ -695,10 +1268,12 @@ class CaptionLauncher:
         self._details_panel.pack(fill="both", expand=True, pady=(4, 0))
         self._details_button.configure(text="运行详情  ▲")
         if self._root.state() == "normal":
-            width = max(self._root.winfo_width(), 740)
-            height = max(self._root.winfo_height(), 620)
+            width = max(self._root.winfo_width(), 700)
+            height = max(self._root.winfo_height(), 480)
             self._collapsed_geometry = (width, height)
-            self._root.geometry(f"{width}x{max(height + 110, 740)}")
+            screen_limit = max(480, self._root.winfo_screenheight() - 60)
+            expanded_height = min(max(height + 110, 620), screen_limit)
+            self._root.geometry(f"{width}x{expanded_height}")
 
     def _hide_details(self) -> None:
         if not self._details_visible:
@@ -716,32 +1291,177 @@ class CaptionLauncher:
 
         if self._process is not None:
             return
-        missing = [
-            path
-            for path in required_paths(self._project_root, self._portable)
-            if not path.is_file()
-        ]
-        if missing:
-            messagebox.showerror(
-                "缺少运行文件",
-                "以下文件不存在：\n\n" + "\n".join(str(path) for path in missing),
+        if self._start_validation_running:
+            messagebox.showinfo(
+                "正在复验音频设备",
+                "请等待设备复验完成。",
                 parent=self._root,
             )
             return
-        invalid = invalid_large_files(self._project_root)
-        if invalid:
-            messagebox.showerror(
-                "运行文件不完整",
-                "以下大模型文件大小不正确，可能复制不完整：\n\n"
-                + "\n".join(str(path) for path in invalid),
+        if self._audio_test_running:
+            messagebox.showinfo(
+                "正在检测声音",
+                "请等待声音检测完成后再开始字幕。",
                 parent=self._root,
             )
+            return
+        if not self._environment_check_complete:
+            messagebox.showinfo(
+                "正在进行启动前自检",
+                "运行文件和 GPU 仍在检查，请稍候再试。",
+                parent=self._root,
+            )
+            return
+        if not self._device_scan_complete:
+            messagebox.showinfo(
+                "正在检查音频设备",
+                "音频设备仍在刷新，请稍候再试。",
+                parent=self._root,
+            )
+            return
+        if not self._audio_devices:
+            messagebox.showerror(
+                "没有可用的系统声音设备",
+                "没有找到 WASAPI 回环设备。请确认扬声器或耳机已连接，然后点击刷新。",
+                parent=self._root,
+            )
+            return
+        if self._installation_ready is not True:
+            messagebox.showerror(
+                "运行文件检查未通过",
+                self._installation_message,
+                parent=self._root,
+            )
+            return
+        if self._runtime_available is not True:
+            messagebox.showerror(
+                "识别运行库不可用",
+                "CTranslate2 或其本地依赖加载失败，CPU 模式也无法解决。\n\n"
+                "请重新解压完整便携版，或重新安装项目依赖。",
+                parent=self._root,
+            )
+            return
+        files_ready, files_message = check_installation_files(
+            self._project_root, self._portable
+        )
+        if not files_ready:
+            self._installation_ready = False
+            self._installation_message = files_message
+            self._refresh_environment_status()
+            self._refresh_start_availability()
+            messagebox.showerror(
+                "运行文件复验未通过",
+                files_message,
+                parent=self._root,
+            )
+            return
+        if self._cuda_available is False and not self._cpu.get():
+            use_cpu = messagebox.askyesno(
+                "未检测到可用的 NVIDIA 显卡",
+                "启动前自检没有发现可用的 CUDA 环境。\n\n"
+                "是否改用速度较慢的 CPU 兼容模式？",
+                parent=self._root,
+            )
+            if not use_cpu:
+                return
+            self._cpu.set(True)
+            self._refresh_cpu_toggle()
+            self._refresh_environment_status()
+        if self._selected_device_index is not None:
+            expected = self._audio_devices.get(self._selected_device_index, {})
+            self._start_device_validation(
+                self._selected_device_index,
+                str(expected.get("name", "")),
+            )
+            return
+        self._launch_caption_process()
+
+    def _start_device_validation(self, device_index: int, expected_name: str) -> None:
+        self._start_attempt += 1
+        attempt = self._start_attempt
+        self._start_validation_running = True
+        self._refresh_start_availability()
+        self._device_menu_button.configure(state="disabled")
+        self._refresh_devices_button.configure(state="disabled")
+        self._audio_test_button.configure(state="disabled")
+        self._set_status("●  正在复验音频设备……", "#fbbf24")
+        threading.Thread(
+            target=self._run_start_device_validation,
+            args=(attempt, device_index, expected_name),
+            name="launcher-start-device-validation",
+            daemon=True,
+        ).start()
+
+    def _run_start_device_validation(
+        self,
+        attempt: int,
+        device_index: int,
+        expected_name: str,
+    ) -> None:
+        try:
+            from .audio_capture import SystemAudioCapture
+
+            current_devices = SystemAudioCapture.list_loopback_devices()
+            matching = next(
+                (
+                    device
+                    for device in current_devices
+                    if int(device.get("index", -1)) == device_index
+                    and device.get("isLoopbackDevice", True)
+                ),
+                None,
+            )
+            valid = matching is not None and matching.get("name") == expected_name
+            self._events.put(("start_device_validation", (attempt, valid, None)))
+        except Exception as error:
+            self._events.put(
+                ("start_device_validation", (attempt, False, str(error)))
+            )
+
+    def _finish_start_device_validation(
+        self,
+        attempt: int,
+        valid: bool,
+        error: str | None,
+    ) -> None:
+        from tkinter import messagebox
+
+        self._start_validation_running = False
+        if attempt != self._start_attempt or self._close_requested:
+            self._maybe_finish_close()
+            return
+        if error is not None:
+            messagebox.showerror(
+                "无法复验音频设备",
+                f"音频设备状态已变化或读取失败：{error}\n\n请点击刷新后重试。",
+                parent=self._root,
+            )
+            self._set_status("●  未运行", "#9ca3af")
+            self._refresh_devices()
+            return
+        if not valid:
+            messagebox.showerror(
+                "所选音频设备已变化",
+                "原来选择的扬声器或耳机已拔出或编号发生变化。\n\n"
+                "请在刷新后重新选择设备。",
+                parent=self._root,
+            )
+            self._set_status("●  未运行", "#9ca3af")
+            self._refresh_devices()
+            return
+        self._launch_caption_process()
+
+    def _launch_caption_process(self) -> None:
+        from tkinter import messagebox
+
+        if self._close_requested or self._process is not None:
             return
         options = LauncherOptions(
-            LANGUAGES[self._language.get()],
-            int(round(self._font_size.get())),
-            self._opacity.get() / 100,
-            self._cpu.get(),
+            language=LANGUAGES[self._language.get()],
+            font_size=int(round(self._font_size.get())),
+            opacity=self._opacity.get() / 100,
+            cpu=self._cpu.get(),
+            device_index=self._selected_device_index,
         )
         command = build_caption_command(self._project_root, options, self._portable)
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
@@ -765,6 +1485,7 @@ class CaptionLauncher:
             if "process" in locals():
                 process.kill()
             messagebox.showerror("无法启动字幕", str(error), parent=self._root)
+            self._restore_idle_after_start_failure()
             return
         self._process = process
         self._process_job = process_job
@@ -774,6 +1495,17 @@ class CaptionLauncher:
         self._set_status("●  正在加载本地模型……", "#fbbf24")
         self._append_log("正在启动；首次加载通常需要几秒钟……")
         threading.Thread(target=self._read_output, args=(process,), daemon=True).start()
+
+    def _restore_idle_after_start_failure(self) -> None:
+        self._set_status("●  未运行", "#9ca3af")
+        self._device_menu_button.configure(
+            state="normal" if self._audio_devices else "disabled"
+        )
+        self._refresh_devices_button.configure(state="normal")
+        self._audio_test_button.configure(
+            state="normal" if self._audio_devices else "disabled"
+        )
+        self._refresh_start_availability()
 
     def stop_caption(self) -> None:
         process = self._process
@@ -807,6 +1539,65 @@ class CaptionLauncher:
                     status = launcher_status_from_line(value)
                     if status is not None:
                         self._set_status(*status)
+                elif event == "devices":
+                    generation, devices = value
+                    if generation != self._device_scan_generation:
+                        continue
+                    self._apply_audio_devices(devices)
+                    if self._audio_devices:
+                        self._append_log(
+                            f"检测到 {len(self._audio_devices)} 个系统输出设备。"
+                        )
+                    else:
+                        self._audio_test_status.configure(
+                            text="没有找到系统输出设备", fg="#f87171"
+                        )
+                    if self._maybe_finish_close():
+                        return
+                elif event == "device_error":
+                    generation, error = value
+                    if generation != self._device_scan_generation:
+                        continue
+                    self._device_scan_complete = True
+                    self._device_scan_running = False
+                    self._audio_devices = {}
+                    self._device_menu_button.configure(
+                        text="音频设备读取失败", state="disabled"
+                    )
+                    self._refresh_devices_button.configure(state="normal")
+                    self._audio_test_status.configure(
+                        text="请点击刷新重试", fg="#f87171"
+                    )
+                    self._append_log(f"音频设备读取失败：{error}")
+                    self._refresh_start_availability()
+                    if self._maybe_finish_close():
+                        return
+                elif event == "audio_level":
+                    self._set_audio_level(value)
+                elif event == "audio_test_device":
+                    self._audio_test_status.configure(
+                        text=f"正在检测：{value}", fg="#fbbf24"
+                    )
+                elif event == "audio_test_complete":
+                    self._finish_audio_test(value)
+                    if self._maybe_finish_close():
+                        return
+                elif event == "audio_test_error":
+                    self._finish_audio_test(None, value)
+                    if self._maybe_finish_close():
+                        return
+                elif event == "audio_test_cancelled":
+                    self._finish_audio_test(None, cancelled=True)
+                    if self._maybe_finish_close():
+                        return
+                elif event == "environment":
+                    self._apply_environment_check(*value)
+                    if self._maybe_finish_close():
+                        return
+                elif event == "start_device_validation":
+                    self._finish_start_device_validation(*value)
+                    if self._maybe_finish_close():
+                        return
                 elif event == "exit":
                     self._process = None
                     if self._process_job is not None:
@@ -825,8 +1616,7 @@ class CaptionLauncher:
                         self._append_log(f"字幕进程已退出（代码 {value}）。")
                         self._show_details()
                     self._stop_requested = False
-                    if self._close_requested:
-                        self._root.destroy()
+                    if self._maybe_finish_close():
                         return
                 elif event == "force_error":
                     self._append_log(f"强制停止遇到问题：{value}")
@@ -843,11 +1633,20 @@ class CaptionLauncher:
         else:
             self._stop_button.grid_remove()
             self._start_button.grid()
-            self._start_button.configure(state="normal")
         self._refresh_language_buttons()
         self._font_scale.configure(state="disabled" if running else "normal")
         self._opacity_scale.configure(state="disabled" if running else "normal")
         self._refresh_cpu_toggle()
+        self._device_menu_button.configure(
+            state="disabled" if running or not self._audio_devices else "normal"
+        )
+        self._refresh_devices_button.configure(
+            state="disabled" if running else "normal"
+        )
+        self._audio_test_button.configure(
+            state="disabled" if running or not self._audio_devices else "normal"
+        )
+        self._refresh_start_availability()
 
     def _set_status(self, text: str, color: str) -> None:
         status_backgrounds = {
@@ -900,10 +1699,58 @@ class CaptionLauncher:
 
     def _request_close(self) -> None:
         if self._process is None:
+            self._close_requested = True
+            self._start_attempt += 1
+            if self._audio_test_running:
+                self._audio_test_cancel.set()
+            if (
+                self._audio_test_running
+                or self._device_scan_running
+                or self._environment_check_running
+                or self._start_validation_running
+            ):
+                self._start_button.configure(state="disabled")
+                self._audio_test_button.configure(
+                    state="disabled", text="正在关闭……"
+                )
+                self._audio_test_status.configure(
+                    text="正在等待后台检查安全结束……", fg="#fbbf24"
+                )
+                self._schedule_close_deadline()
+                return
             self._root.destroy()
             return
         self._close_requested = True
         self.stop_caption()
+
+    def _schedule_close_deadline(self) -> None:
+        if self._close_deadline_job is None:
+            self._close_deadline_job = self._root.after(
+                4_000, self._force_close_background
+            )
+
+    def _force_close_background(self) -> None:
+        self._close_deadline_job = None
+        self._start_attempt += 1
+        self._device_scan_generation += 1
+        self._root.destroy()
+
+    def _maybe_finish_close(self) -> bool:
+        if not self._close_requested:
+            return False
+        if (
+            self._process is not None
+            or self._audio_test_running
+            or self._device_scan_running
+            or self._environment_check_running
+            or self._start_validation_running
+        ):
+            return False
+        if self._close_deadline_job is not None:
+            self._root.after_cancel(self._close_deadline_job)
+            self._close_deadline_job = None
+        self._root.destroy()
+        return True
 
     def _force_stop(self) -> None:
         self._force_stop_job = None

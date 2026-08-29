@@ -236,13 +236,25 @@ def main() -> int:
         return 0
     finally:
         if capture is not None:
-            capture.stop()
+            try:
+                capture.stop()
+            except Exception as error:
+                print(f"音频设备关闭失败：{error}", file=sys.stderr)
         if pipeline is not None and pipeline_started:
-            pipeline.stop()
+            try:
+                pipeline.stop()
+            except Exception as error:
+                print(f"字幕状态清理失败：{error}", file=sys.stderr)
         elif translator is not None:
-            translator.close()
+            try:
+                translator.close()
+            except Exception as error:
+                print(f"翻译服务关闭失败：{error}", file=sys.stderr)
         if overlay is not None:
-            overlay.stop()
+            try:
+                overlay.stop()
+            except Exception as error:
+                print(f"字幕窗口关闭失败：{error}", file=sys.stderr)
         print("已停止并清空会话内存。")
     return 0
 

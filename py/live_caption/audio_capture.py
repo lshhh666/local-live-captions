@@ -44,13 +44,30 @@ class SystemAudioCapture:
         return dict(device)
 
     def stop(self) -> None:
-        if self._stream is not None:
-            self._stream.stop_stream()
-            self._stream.close()
-            self._stream = None
-        if self._pyaudio is not None:
-            self._pyaudio.terminate()
-            self._pyaudio = None
+        stream = self._stream
+        audio = self._pyaudio
+        self._stream = None
+        self._pyaudio = None
+        first_error: Exception | None = None
+        try:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                except Exception as error:
+                    first_error = error
+                finally:
+                    try:
+                        stream.close()
+                    except Exception as error:
+                        first_error = first_error or error
+        finally:
+            if audio is not None:
+                try:
+                    audio.terminate()
+                except Exception as error:
+                    first_error = first_error or error
+        if first_error is not None:
+            raise first_error
 
     def _resolve_device(self, device_index: int | None) -> dict:
         assert self._pyaudio is not None
@@ -84,4 +101,3 @@ class SystemAudioCapture:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.stop()
-
