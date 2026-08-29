@@ -13,6 +13,7 @@ from live_caption.launcher import (
     build_caption_command,
     invalid_large_files,
     is_caption_output,
+    launcher_status_from_line,
     required_paths,
     validate_options,
 )
@@ -83,6 +84,25 @@ class LauncherCommandTests(unittest.TestCase):
         self.assertTrue(is_caption_output("RU✓ final sentence"))
         self.assertFalse(is_caption_output("监听设备：Speakers"))
 
+    def test_worker_output_maps_to_clear_startup_progress(self) -> None:
+        self.assertEqual(
+            ("●  正在加载识别模型  1/3", "#fbbf24"),
+            launcher_status_from_line("正在加载本地语音识别模型（RTX/CUDA）"),
+        )
+        self.assertEqual(
+            ("●  正在加载翻译模型  2/3", "#fbbf24"),
+            launcher_status_from_line("正在加载本地中文翻译模型……"),
+        )
+        self.assertEqual(
+            ("●  正在连接系统声音  3/3", "#fbbf24"),
+            launcher_status_from_line("中文翻译模型已就绪。"),
+        )
+        self.assertEqual(
+            ("●  字幕运行中", "#4ade80"),
+            launcher_status_from_line("监听设备：扬声器 [Loopback]"),
+        )
+        self.assertIsNone(launcher_status_from_line("普通运行日志"))
+
     def test_failed_taskkill_falls_back_to_session_job(self) -> None:
         class FakeProcess:
             pid = 1234
@@ -123,9 +143,11 @@ class LauncherCommandTests(unittest.TestCase):
         launcher._append_log = MagicMock()
         launcher._set_status = MagicMock()
         launcher._set_running_controls = MagicMock()
+        launcher._show_details = MagicMock()
         launcher._poll_events()
         launcher._clear_log.assert_not_called()
         launcher._append_log.assert_called_with("字幕进程已退出（代码 7）。")
+        launcher._show_details.assert_called_once_with()
 
 
 if __name__ == "__main__":

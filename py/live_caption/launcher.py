@@ -45,6 +45,19 @@ def is_caption_output(text: str) -> bool:
     return text.startswith(CAPTION_PREFIXES)
 
 
+def launcher_status_from_line(text: str) -> tuple[str, str] | None:
+    """Translate worker diagnostics into short, user-facing progress states."""
+    if text.startswith("正在加载本地语音识别模型"):
+        return "●  正在加载识别模型  1/3", "#fbbf24"
+    if text.startswith("正在加载本地中文翻译模型"):
+        return "●  正在加载翻译模型  2/3", "#fbbf24"
+    if text.startswith("中文翻译模型已就绪"):
+        return "●  正在连接系统声音  3/3", "#fbbf24"
+    if text.startswith("监听设备："):
+        return "●  字幕运行中", "#4ade80"
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class LauncherOptions:
     language: str = "en"
@@ -144,115 +157,256 @@ class CaptionLauncher:
         root = tk.Tk()
         self._root = root
         root.title("本地实时字幕")
-        root.geometry("560x610")
-        root.minsize(520, 570)
-        root.configure(bg="#111827")
+        root.geometry("600x540")
+        root.minsize(560, 540)
+        root.configure(bg="#0b1220")
         root.protocol("WM_DELETE_WINDOW", self._request_close)
 
         style = ttk.Style(root)
         style.theme_use("clam")
-        style.configure("Panel.TFrame", background="#1f2937")
-        style.configure("Title.TLabel", background="#111827", foreground="#f9fafb", font=("Microsoft YaHei UI", 20, "bold"))
-        style.configure("Subtitle.TLabel", background="#111827", foreground="#9ca3af", font=("Microsoft YaHei UI", 10))
-        style.configure("Panel.TLabel", background="#1f2937", foreground="#e5e7eb", font=("Microsoft YaHei UI", 10))
-        style.configure("Privacy.TLabel", background="#132e2a", foreground="#a7f3d0", font=("Microsoft YaHei UI", 10))
-        style.configure("Start.TButton", font=("Microsoft YaHei UI", 12, "bold"), padding=11)
-        style.configure("Stop.TButton", font=("Microsoft YaHei UI", 11), padding=10)
-        style.configure("TCheckbutton", background="#1f2937", foreground="#e5e7eb")
+        style.configure("App.TFrame", background="#0b1220")
+        style.configure("Card.TFrame", background="#172033")
+        style.configure(
+            "Title.TLabel",
+            background="#0b1220",
+            foreground="#f8fafc",
+            font=("Microsoft YaHei UI", 21, "bold"),
+        )
+        style.configure(
+            "Subtitle.TLabel",
+            background="#0b1220",
+            foreground="#94a3b8",
+            font=("Microsoft YaHei UI", 10),
+        )
+        style.configure(
+            "Section.TLabel",
+            background="#172033",
+            foreground="#f1f5f9",
+            font=("Microsoft YaHei UI", 11, "bold"),
+        )
+        style.configure(
+            "Card.TLabel",
+            background="#172033",
+            foreground="#dbe4f0",
+            font=("Microsoft YaHei UI", 10),
+        )
+        style.configure(
+            "Muted.TLabel",
+            background="#172033",
+            foreground="#8290a6",
+            font=("Microsoft YaHei UI", 9),
+        )
+        style.configure(
+            "Primary.TButton",
+            background="#2563eb",
+            foreground="#ffffff",
+            borderwidth=0,
+            focusthickness=0,
+            font=("Microsoft YaHei UI", 12, "bold"),
+            padding=(18, 12),
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("pressed", "#1d4ed8"), ("active", "#3b82f6")],
+        )
+        style.configure(
+            "Danger.TButton",
+            background="#dc2626",
+            foreground="#ffffff",
+            borderwidth=0,
+            focusthickness=0,
+            font=("Microsoft YaHei UI", 12, "bold"),
+            padding=(18, 12),
+        )
+        style.map(
+            "Danger.TButton",
+            background=[("pressed", "#b91c1c"), ("active", "#ef4444")],
+        )
+        style.configure(
+            "Link.TButton",
+            background="#0b1220",
+            foreground="#94a3b8",
+            borderwidth=0,
+            focusthickness=0,
+            font=("Microsoft YaHei UI", 9),
+            padding=(0, 5),
+        )
+        style.map("Link.TButton", foreground=[("active", "#dbeafe")])
+        style.configure(
+            "Compat.TCheckbutton",
+            background="#172033",
+            foreground="#e2e8f0",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        style.map(
+            "Compat.TCheckbutton",
+            background=[("active", "#172033")],
+            foreground=[("disabled", "#64748b")],
+        )
+        style.configure(
+            "App.Horizontal.TScale",
+            background="#172033",
+            troughcolor="#334155",
+        )
+        style.configure(
+            "App.TCombobox",
+            fieldbackground="#eef2f7",
+            background="#eef2f7",
+            foreground="#111827",
+            arrowcolor="#475569",
+            padding=6,
+        )
 
-        outer = ttk.Frame(root, padding=24, style="Panel.TFrame")
-        outer.pack(fill="both", expand=True, padx=18, pady=18)
+        outer = ttk.Frame(root, padding=(28, 22, 28, 18), style="App.TFrame")
+        outer.pack(fill="both", expand=True)
 
-        ttk.Label(root, text="本地实时字幕", style="Title.TLabel").place(x=28, y=20)
+        header = ttk.Frame(outer, style="App.TFrame")
+        header.pack(fill="x")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="本地实时字幕", style="Title.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self._status = tk.Label(
+            header,
+            text="●  未运行",
+            bg="#172033",
+            fg="#94a3b8",
+            padx=12,
+            pady=6,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self._status.grid(row=0, column=1, sticky="e")
         ttk.Label(
-            root,
+            outer,
             text="系统声音实时识别并翻译，全程只在这台电脑上运行",
             style="Subtitle.TLabel",
-        ).place(x=30, y=60)
+        ).pack(anchor="w", pady=(1, 16))
 
-        settings = ttk.Frame(outer, style="Panel.TFrame")
-        settings.pack(fill="x", pady=(58, 8))
+        settings = ttk.Frame(outer, padding=(18, 14), style="Card.TFrame")
+        settings.pack(fill="x")
         settings.columnconfigure(1, weight=1)
+        ttk.Label(settings, text="基本设置", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        )
 
         self._language = tk.StringVar(value="英语")
         self._font_size = tk.IntVar(value=16)
         self._opacity = tk.IntVar(value=90)
         self._cpu = tk.BooleanVar(value=False)
 
-        ttk.Label(settings, text="视频语言", style="Panel.TLabel").grid(row=0, column=0, sticky="w", pady=9)
+        ttk.Label(settings, text="视频语言", style="Card.TLabel").grid(
+            row=1, column=0, sticky="w", pady=7
+        )
         self._language_box = ttk.Combobox(
             settings,
             textvariable=self._language,
             values=tuple(LANGUAGES),
             state="readonly",
-            width=18,
+            style="App.TCombobox",
+            width=16,
         )
-        self._language_box.grid(row=0, column=1, sticky="ew", padx=(24, 0), pady=9)
+        self._language_box.grid(row=1, column=1, sticky="ew", padx=(28, 0), pady=7)
 
-        ttk.Label(settings, text="字幕字号", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=9)
-        font_row = ttk.Frame(settings, style="Panel.TFrame")
-        font_row.grid(row=1, column=1, sticky="ew", padx=(24, 0), pady=9)
+        ttk.Label(settings, text="字幕大小", style="Card.TLabel").grid(
+            row=2, column=0, sticky="w", pady=7
+        )
+        font_row = ttk.Frame(settings, style="Card.TFrame")
+        font_row.grid(row=2, column=1, sticky="ew", padx=(28, 0), pady=7)
         font_row.columnconfigure(0, weight=1)
         self._font_scale = ttk.Scale(
-            font_row, from_=12, to=32, variable=self._font_size, orient="horizontal"
+            font_row,
+            from_=12,
+            to=32,
+            variable=self._font_size,
+            orient="horizontal",
+            style="App.Horizontal.TScale",
         )
         self._font_scale.grid(row=0, column=0, sticky="ew")
-        self._font_value = ttk.Label(font_row, text="16", width=3, style="Panel.TLabel")
+        self._font_value = ttk.Label(font_row, text="16", width=3, style="Card.TLabel")
         self._font_value.grid(row=0, column=1, padx=(12, 0))
         self._font_size.trace_add("write", self._update_values)
 
-        ttk.Label(settings, text="透明度", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=9)
-        opacity_row = ttk.Frame(settings, style="Panel.TFrame")
-        opacity_row.grid(row=2, column=1, sticky="ew", padx=(24, 0), pady=9)
+        ttk.Label(settings, text="字幕透明度", style="Card.TLabel").grid(
+            row=3, column=0, sticky="w", pady=7
+        )
+        opacity_row = ttk.Frame(settings, style="Card.TFrame")
+        opacity_row.grid(row=3, column=1, sticky="ew", padx=(28, 0), pady=7)
         opacity_row.columnconfigure(0, weight=1)
         self._opacity_scale = ttk.Scale(
-            opacity_row, from_=50, to=100, variable=self._opacity, orient="horizontal"
+            opacity_row,
+            from_=50,
+            to=100,
+            variable=self._opacity,
+            orient="horizontal",
+            style="App.Horizontal.TScale",
         )
         self._opacity_scale.grid(row=0, column=0, sticky="ew")
-        self._opacity_value = ttk.Label(opacity_row, text="90%", width=5, style="Panel.TLabel")
+        self._opacity_value = ttk.Label(
+            opacity_row, text="90%", width=5, style="Card.TLabel"
+        )
         self._opacity_value.grid(row=0, column=1, padx=(12, 0))
         self._opacity.trace_add("write", self._update_values)
 
+        compatibility = ttk.Frame(outer, padding=(18, 12), style="Card.TFrame")
+        compatibility.pack(fill="x", pady=(10, 0))
         self._cpu_check = ttk.Checkbutton(
-            settings,
-            text="CPU 兼容模式（仅在显卡无法使用时开启，速度较慢）",
+            compatibility,
+            text="兼容模式",
             variable=self._cpu,
+            style="Compat.TCheckbutton",
         )
-        self._cpu_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 6))
+        self._cpu_check.pack(anchor="w")
+        ttk.Label(
+            compatibility,
+            text="没有可用的 NVIDIA 显卡时开启，字幕速度会明显变慢",
+            style="Muted.TLabel",
+        ).pack(anchor="w", padx=(25, 0), pady=(2, 0))
 
-        privacy = ttk.Frame(outer, padding=12, style="Panel.TFrame")
-        privacy.pack(fill="x", pady=(8, 12))
-        self._privacy_label = ttk.Label(
-            privacy,
-            text="🔒 默认不保存音频或字幕；停止后清空会话内存",
-            style="Privacy.TLabel",
+        self._privacy_label = tk.Label(
+            outer,
+            text="🔒  默认不保存音频或字幕，停止后自动清空会话内存",
+            bg="#0f2a27",
+            fg="#9fe3cf",
+            anchor="w",
+            padx=14,
+            pady=9,
+            font=("Microsoft YaHei UI", 9),
         )
-        self._privacy_label.pack(fill="x")
+        self._privacy_label.pack(fill="x", pady=(10, 0))
 
-        self._status = ttk.Label(
-            outer, text="●  尚未启动", style="Panel.TLabel", anchor="center"
-        )
-        self._status.pack(fill="x", pady=(4, 10))
-
-        buttons = ttk.Frame(outer, style="Panel.TFrame")
-        buttons.pack(fill="x")
-        buttons.columnconfigure((0, 1), weight=1)
+        buttons = ttk.Frame(outer, style="App.TFrame")
+        buttons.pack(fill="x", pady=(14, 4))
+        buttons.columnconfigure(0, weight=1)
         self._start_button = ttk.Button(
-            buttons, text="开始字幕", command=self.start_caption, style="Start.TButton"
+            buttons,
+            text="▶  开始实时字幕",
+            command=self.start_caption,
+            style="Primary.TButton",
         )
-        self._start_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._start_button.grid(row=0, column=0, sticky="ew")
         self._stop_button = ttk.Button(
             buttons,
-            text="停止并清空",
+            text="■  停止并清空",
             command=self.stop_caption,
-            style="Stop.TButton",
+            style="Danger.TButton",
             state="disabled",
         )
-        self._stop_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self._stop_button.grid(row=0, column=0, sticky="ew")
+        self._stop_button.grid_remove()
 
-        ttk.Label(outer, text="运行信息", style="Panel.TLabel").pack(anchor="w", pady=(16, 5))
-        self._log = tk.Text(
+        self._details_visible = False
+        self._collapsed_geometry: tuple[int, int] | None = None
+        self._details_button = ttk.Button(
             outer,
+            text="运行详情  ▼",
+            command=self._toggle_details,
+            style="Link.TButton",
+        )
+        self._details_button.pack(anchor="center")
+        self._details_panel = ttk.Frame(outer, padding=10, style="Card.TFrame")
+        self._log = tk.Text(
+            self._details_panel,
+            width=1,
             height=7,
             bg="#0f172a",
             fg="#cbd5e1",
@@ -268,6 +422,35 @@ class CaptionLauncher:
 
     def run(self) -> None:
         self._root.mainloop()
+
+    def _toggle_details(self) -> None:
+        if self._details_visible:
+            self._hide_details()
+        else:
+            self._show_details()
+
+    def _show_details(self) -> None:
+        if self._details_visible:
+            return
+        self._details_visible = True
+        self._details_panel.pack(fill="both", expand=True, pady=(4, 0))
+        self._details_button.configure(text="运行详情  ▲")
+        if self._root.state() == "normal":
+            width = max(self._root.winfo_width(), 560)
+            height = max(self._root.winfo_height(), 540)
+            self._collapsed_geometry = (width, height)
+            self._root.geometry(f"{width}x{max(height + 160, 700)}")
+
+    def _hide_details(self) -> None:
+        if not self._details_visible:
+            return
+        self._details_visible = False
+        self._details_panel.pack_forget()
+        self._details_button.configure(text="运行详情  ▼")
+        if self._root.state() == "normal" and self._collapsed_geometry is not None:
+            width, height = self._collapsed_geometry
+            self._root.geometry(f"{width}x{height}")
+        self._collapsed_geometry = None
 
     def start_caption(self) -> None:
         from tkinter import messagebox
@@ -362,8 +545,9 @@ class CaptionLauncher:
                 if event == "line":
                     if not is_caption_output(value):
                         self._append_log(value)
-                    if value.startswith("监听设备："):
-                        self._set_status("●  字幕运行中", "#4ade80")
+                    status = launcher_status_from_line(value)
+                    if status is not None:
+                        self._set_status(*status)
                 elif event == "exit":
                     self._process = None
                     if self._process_job is not None:
@@ -380,6 +564,7 @@ class CaptionLauncher:
                     else:
                         self._set_status(f"●  启动失败（代码 {value}）", "#f87171")
                         self._append_log(f"字幕进程已退出（代码 {value}）。")
+                        self._show_details()
                     self._stop_requested = False
                     if self._close_requested:
                         self._root.destroy()
@@ -391,8 +576,14 @@ class CaptionLauncher:
         self._root.after(100, self._poll_events)
 
     def _set_running_controls(self, running: bool) -> None:
-        self._start_button.configure(state="disabled" if running else "normal")
-        self._stop_button.configure(state="normal" if running else "disabled")
+        if running:
+            self._start_button.grid_remove()
+            self._stop_button.grid()
+            self._stop_button.configure(state="normal")
+        else:
+            self._stop_button.grid_remove()
+            self._start_button.grid()
+            self._start_button.configure(state="normal")
         state = "disabled" if running else "readonly"
         self._language_box.configure(state=state)
         self._font_scale.configure(state="disabled" if running else "normal")
@@ -400,7 +591,17 @@ class CaptionLauncher:
         self._cpu_check.configure(state="disabled" if running else "normal")
 
     def _set_status(self, text: str, color: str) -> None:
-        self._status.configure(text=text, foreground=color)
+        status_backgrounds = {
+            "#4ade80": "#113328",
+            "#fbbf24": "#3a2d12",
+            "#f87171": "#3b1d24",
+            "#9ca3af": "#172033",
+        }
+        self._status.configure(
+            text=text,
+            foreground=color,
+            background=status_backgrounds.get(color, "#172033"),
+        )
 
     def _append_log(self, text: str) -> None:
         if not text:
