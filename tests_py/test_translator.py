@@ -13,6 +13,7 @@ from live_caption.translator import (
     has_repeated_chinese_phrase,
     looks_like_context_repetition,
     looks_like_prompt_leak,
+    remove_untranslated_english,
 )
 
 
@@ -131,6 +132,7 @@ class TranslationGuardTests(unittest.TestCase):
         self.assertFalse(has_untranslated_english("Monica。"))
         self.assertFalse(has_untranslated_english("我们可以用 AI。"))
         self.assertFalse(has_untranslated_english("分析 DNA，并比较 DNA。"))
+        self.assertFalse(has_untranslated_english("可以使用 Hugging Face 和 Python。"))
 
     def test_accepts_chinese_translation(self):
         self.assertFalse(has_untranslated_english("相信我，一旦开始用英语思考，一切都会容易起来。"))
@@ -194,6 +196,24 @@ class TranslationGuardTests(unittest.TestCase):
             "我非常推荐去看看。",
             translator.translate("I definitely recommend checking it out.", ()),
         )
+
+    def test_salvages_chinese_when_unknown_adverb_stays_in_english(self):
+        translator = object.__new__(LlamaCppTranslator)
+        responses = iter(
+            (
+                "我 genuinely 推荐去看看。",
+                "我 genuinely 推荐去看看。",
+                "genuinely",
+            )
+        )
+        translator._request = lambda prompt: next(responses)
+        self.assertEqual(
+            "我推荐去看看。",
+            translator.translate("I genuinely recommend checking it out.", ()),
+        )
+
+    def test_does_not_salvage_an_entirely_english_response(self):
+        self.assertEqual("", remove_untranslated_english("still entirely English"))
 
     def test_translates_cheers_as_a_toast_when_context_mentions_drinks(self):
         translator = object.__new__(LlamaCppTranslator)

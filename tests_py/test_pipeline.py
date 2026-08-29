@@ -102,6 +102,50 @@ class _LatestOnlyTranslator:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_merges_lowercase_prepositional_tail_across_forced_boundary(self) -> None:
+        captions = []
+        pipeline = CaptionPipeline(
+            RuntimeConfig(), _ListRecognizer("unused"), _BlockingTranslator(), captions.append
+        )
+        pipeline._append_source(
+            "If I moved back to London, I would probably move back.",
+            chunk_is_final=False,
+        )
+        pipeline._append_source("into this area.", chunk_is_final=False)
+        self.assertEqual(
+            "If I moved back to London, I would probably move back into this area.",
+            captions[-1].source_text,
+        )
+        self.assertFalse(captions[-1].is_final)
+
+    def test_does_not_merge_capitalized_prepositional_sentence(self) -> None:
+        captions = []
+        pipeline = CaptionPipeline(
+            RuntimeConfig(), _ListRecognizer("unused"), _BlockingTranslator(), captions.append
+        )
+        pipeline._append_source("The first sentence ends.", chunk_is_final=False)
+        pipeline._append_source("Within minutes, everything changed.", chunk_is_final=False)
+        self.assertEqual(("The first sentence ends.", True), (captions[1].source_text, captions[1].is_final))
+        self.assertEqual("Within minutes, everything changed.", captions[-1].source_text)
+
+    def test_queued_final_translation_is_selected_before_partial(self) -> None:
+        pipeline = CaptionPipeline(
+            RuntimeConfig(), _ListRecognizer("unused"), _BlockingTranslator(), lambda caption: None
+        )
+        partial = (1, 1, None, "partial", False, ())
+        final = (2, 1, None, "final", True, ())
+        with pipeline._revision_lock:
+            pipeline._latest_revisions.update({1: 1, 2: 1})
+        pipeline._translation_queue.put(partial)
+        pipeline._translation_queue.put(final)
+
+        selected = pipeline._get_next_translation(timeout=0.1)
+        self.assertEqual(final, selected)
+        pipeline._translation_queue.task_done()
+        deferred = pipeline._translation_queue.get_nowait()
+        self.assertEqual(partial, deferred)
+        pipeline._translation_queue.task_done()
+
     def test_merges_gerund_complement_split_by_forced_audio_boundary(self) -> None:
         captions = []
         pipeline = CaptionPipeline(

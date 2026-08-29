@@ -16,6 +16,14 @@ class CaptionPipeline:
     _PREFERRED_CLAUSE_WORDS = 14
     _CLAUSE_CONNECTORS = {"although", "and", "because", "but", "however", "so", "though", "while"}
     _GERUND_COMPLEMENT_VERBS = {"recommend", "recommended"}
+    _LOWERCASE_CONTINUATION_WORDS = {
+        "into",
+        "onto",
+        "throughout",
+        "toward",
+        "towards",
+        "within",
+    }
     _NON_TERMINAL_ABBREVIATIONS = {
         "dr.",
         "e.g.",
@@ -50,6 +58,7 @@ class CaptionPipeline:
         )
         self._recognition_queue: queue.Queue = queue.Queue(config.recognition_queue_size)
         self._translation_queue: queue.Queue = queue.Queue(config.translation_queue_size)
+        self._translation_queue_lock = threading.Lock()
         self._stop = threading.Event()
         self._revision_lock = threading.Lock()
         self._latest_revisions: dict[int, int] = {}
@@ -151,7 +160,7 @@ class CaptionPipeline:
     def _run_translation(self) -> None:
         while not self._stop.is_set():
             try:
-                item = self._translation_queue.get(timeout=0.2)
+                item = self._get_next_translation(timeout=0.2)
             except queue.Empty:
                 continue
             sentence_id, revision, timestamp, source, is_final, context = item
@@ -185,6 +194,37 @@ class CaptionPipeline:
                     if self._latest_revisions.get(sentence_id) == revision:
                         self._latest_revisions.pop(sentence_id, None)
                 self._translation_queue.task_done()
+
+    def _get_next_translation(self, timeout: float):
+        """Prefer a queued final sentence over provisional work without losing either."""
+        first = self._translation_queue.get(timeout=timeout)
+        if first[4]:
+            return first
+
+        with self._translation_queue_lock:
+            deferred = []
+            selected = None
+            while True:
+                try:
+                    candidate = self._translation_queue.get_nowait()
+                except queue.Empty:
+                    break
+                with self._revision_lock:
+                    is_current = self._latest_revisions.get(candidate[0]) == candidate[1]
+                if selected is None and candidate[4] and is_current:
+                    selected = candidate
+                else:
+                    deferred.append(candidate)
+
+            if selected is None:
+                selected = first
+            else:
+                deferred.insert(0, first)
+
+            for item in deferred:
+                self._translation_queue.task_done()
+                self._translation_queue.put_nowait(item)
+        return selected
 
     def _emit_pending(self, is_final: bool) -> None:
         if not self._pending_source:
@@ -230,6 +270,7 @@ class CaptionPipeline:
         # A forced audio cut may end with plausible sentence punctuation. Wait
         # until the next recognized text arrives before trusting that boundary.
         source = self._merge_gerund_complement_across_boundary(source)
+        source = self._merge_lowercase_continuation_across_boundary(source)
         pending_words = len(self._pending_source.split())
         first_source_word = self._normalized_word(source.split()[0]) if source.split() else ""
         if self._pending_source and (
@@ -321,7 +362,28 @@ class CaptionPipeline:
         self._pending_source = re.sub(r"[.!?]+\Z", "", self._pending_source).rstrip()
         return " ".join(source_tokens[1:])
 
+    def _merge_lowercase_continuation_across_boundary(self, source: str) -> str:
+        """Do not strand a lowercase prepositional tail after a forced audio cut."""
+        source_tokens = source.split()
+        if not self._pending_source or not source_tokens or not self._ends_sentence(self._pending_source):
+            return source
+        raw_first = source_tokens[0].lstrip('"\'([{')
+        if (
+            not raw_first[:1].islower()
+            or self._normalized_word(raw_first) not in self._LOWERCASE_CONTINUATION_WORDS
+        ):
+            return source
+        self._pending_source = re.sub(r"[.!?]+\Z", "", self._pending_source).rstrip()
+        return source
+
     def _put_latest(self, target: queue.Queue, item, label: str) -> None:
+        if target is self._translation_queue:
+            with self._translation_queue_lock:
+                self._put_latest_unlocked(target, item, label)
+            return
+        self._put_latest_unlocked(target, item, label)
+
+    def _put_latest_unlocked(self, target: queue.Queue, item, label: str) -> None:
         try:
             target.put_nowait(item)
             return

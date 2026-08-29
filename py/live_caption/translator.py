@@ -65,16 +65,17 @@ _ALLOWED_CJK_REDUPLICATIONS = {
 
 
 def has_untranslated_english(text: str) -> bool:
-    """Detect obvious copied English while allowing a single proper name or acronym."""
+    """Detect obvious copied English while allowing proper names and acronyms."""
     words = [
         word
         for word in _ENGLISH_WORD.findall(text)
         if not (len(word) > 1 and word.isupper())
     ]
-    if len(words) >= 2:
+    if len(words) >= 4:
         return True
-    return len(words) == 1 and (
-        words[0][:1].islower() or words[0].lower() in _COMMON_TRANSLATIONS
+    return any(
+        word[:1].islower() or word.lower() in _COMMON_TRANSLATIONS
+        for word in words
     )
 
 
@@ -89,6 +90,20 @@ def clean_translation(text: str) -> str:
     cleaned = re.sub(rf"(?<=[{_CJK}])\s+(?=[{_CJK}])", "", cleaned)
     cleaned = re.sub(r"而且嗯，", "然后", cleaned)
     return cleaned
+
+
+def remove_untranslated_english(text: str) -> str:
+    """Salvage useful Chinese when a small model stubbornly leaves a minor English fragment."""
+    if not re.search(rf"[{_CJK}]", text):
+        return ""
+    cleaned = text
+    for match in reversed(tuple(_ENGLISH_RUN.finditer(cleaned))):
+        if has_untranslated_english(match.group()):
+            cleaned = cleaned[: match.start()] + cleaned[match.end() :]
+    cleaned = clean_translation(cleaned)
+    cleaned = re.sub(r"([，。！？；：])\1+", r"\1", cleaned)
+    cleaned = re.sub(r"^[，；：、]+|[，；：、]+$", "", cleaned).strip()
+    return cleaned if re.search(rf"[{_CJK}]", cleaned) else ""
 
 
 def has_repeated_chinese_phrase(text: str) -> bool:
@@ -271,6 +286,10 @@ class LlamaCppTranslator:
                 pass
         if translated and has_untranslated_english(translated):
             translated = self._repair_residual_english(source_text, translated)
+        if translated and has_untranslated_english(translated):
+            salvaged = remove_untranslated_english(translated)
+            if salvaged and not has_untranslated_english(salvaged):
+                translated = salvaged
         if (
             looks_like_prompt_leak(translated)
             or has_untranslated_english(translated)
