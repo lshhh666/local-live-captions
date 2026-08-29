@@ -10,6 +10,7 @@ from live_caption.launcher import (
     CaptionLauncher,
     LauncherOptions,
     application_root,
+    blend_hex_colors,
     build_caption_command,
     invalid_large_files,
     is_caption_output,
@@ -102,6 +103,99 @@ class LauncherCommandTests(unittest.TestCase):
             launcher_status_from_line("监听设备：扬声器 [Loopback]"),
         )
         self.assertIsNone(launcher_status_from_line("普通运行日志"))
+
+    def test_opacity_preview_blends_colors(self) -> None:
+        self.assertEqual("#808080", blend_hex_colors("#ffffff", "#000000", 0.5))
+        self.assertEqual("#ffffff", blend_hex_colors("#ffffff", "#000000", 1.0))
+        with self.assertRaises(ValueError):
+            blend_hex_colors("#ffffff", "#000000", 1.1)
+
+    def test_language_selection_updates_preview_only_while_idle(self) -> None:
+        launcher = object.__new__(CaptionLauncher)
+        launcher._controls_running = False
+        launcher._language = MagicMock()
+        launcher._refresh_language_buttons = MagicMock()
+        launcher._update_preview_language = MagicMock()
+
+        launcher._select_language("俄语")
+        launcher._language.set.assert_called_once_with("俄语")
+        launcher._refresh_language_buttons.assert_called_once_with()
+        launcher._update_preview_language.assert_called_once_with()
+
+        launcher._controls_running = True
+        launcher._language.reset_mock()
+        launcher._select_language("自动识别")
+        launcher._language.set.assert_not_called()
+
+    def test_russian_language_selection_updates_preview_copy(self) -> None:
+        launcher = object.__new__(CaptionLauncher)
+        launcher._language = MagicMock()
+        launcher._language.get.return_value = "俄语"
+        launcher._preview_source = MagicMock()
+        launcher._preview_translation = MagicMock()
+
+        launcher._update_preview_language()
+        launcher._preview_source.configure.assert_called_once_with(
+            text="Всё в порядке, но я предпочитаю утро."
+        )
+        launcher._preview_translation.configure.assert_called_once_with(
+            text="一切都没问题，不过我更喜欢早上。"
+        )
+
+    def test_cpu_toggle_updates_only_while_idle(self) -> None:
+        launcher = object.__new__(CaptionLauncher)
+        launcher._controls_running = False
+        launcher._cpu = MagicMock()
+        launcher._cpu.get.return_value = False
+        launcher._refresh_cpu_toggle = MagicMock()
+
+        launcher._toggle_cpu_mode()
+        launcher._cpu.set.assert_called_once_with(True)
+        launcher._refresh_cpu_toggle.assert_called_once_with()
+
+        launcher._controls_running = True
+        launcher._cpu.reset_mock()
+        launcher._toggle_cpu_mode()
+        launcher._cpu.set.assert_not_called()
+
+    def test_running_controls_swap_the_primary_action_and_lock_settings(self) -> None:
+        launcher = object.__new__(CaptionLauncher)
+        launcher._start_button = MagicMock()
+        launcher._stop_button = MagicMock()
+        launcher._font_scale = MagicMock()
+        launcher._opacity_scale = MagicMock()
+        launcher._refresh_language_buttons = MagicMock()
+        launcher._refresh_cpu_toggle = MagicMock()
+
+        launcher._set_running_controls(True)
+        self.assertTrue(launcher._controls_running)
+        launcher._start_button.grid_remove.assert_called_once_with()
+        launcher._stop_button.grid.assert_called_once_with()
+        launcher._stop_button.configure.assert_called_with(state="normal")
+        launcher._font_scale.configure.assert_called_with(state="disabled")
+        launcher._opacity_scale.configure.assert_called_with(state="disabled")
+
+        launcher._set_running_controls(False)
+        self.assertFalse(launcher._controls_running)
+        launcher._stop_button.grid_remove.assert_called_once_with()
+        launcher._start_button.grid.assert_called_once_with()
+        launcher._start_button.configure.assert_called_with(state="normal")
+
+    def test_detail_panel_restores_the_previous_window_geometry(self) -> None:
+        launcher = object.__new__(CaptionLauncher)
+        launcher._details_visible = False
+        launcher._collapsed_geometry = None
+        launcher._details_panel = MagicMock()
+        launcher._details_button = MagicMock()
+        launcher._root = MagicMock()
+        launcher._root.state.return_value = "normal"
+        launcher._root.winfo_width.return_value = 800
+        launcher._root.winfo_height.return_value = 650
+
+        launcher._show_details()
+        launcher._root.geometry.assert_called_with("800x760")
+        launcher._hide_details()
+        launcher._root.geometry.assert_called_with("800x650")
 
     def test_failed_taskkill_falls_back_to_session_job(self) -> None:
         class FakeProcess:
